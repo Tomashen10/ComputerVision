@@ -1,0 +1,507 @@
+Models python code - Real Hydrocyclone images
+
+ResNet-18 model training code
+
+#Import packages
+
+from __future__ import print_function, division
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.optim import lr_scheduler
+import torch.backends.cudnn as cudnnwhci
+import numpy as np
+import torchvision
+from torchvision import datasets, models, transforms
+from torchvision.transforms import v2
+from torch.utils.data import DataLoader, random_split,Subset
+from torchvision.datasets import ImageFolder
+import matplotlib.pyplot as plt
+import time
+import os
+import copy
+from tempfile import TemporaryDirectory
+import random
+from sklearn.model_selection import train_test_split
+import shutil
+
+import random
+random.seed(42)
+
+device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+
+#Set-up performance metrics
+def evaluate_model_metrics(model, dataloader, device):
+    model.eval()
+    y_true = []
+    y_pred = []
+
+    with torch.no_grad():
+        for inputs, labels in dataloader:
+            inputs = inputs.to(device)
+            labels = labels.to(device)
+
+            outputs = model(inputs)
+            _, preds = torch.max(outputs, 1)
+
+            y_true.extend(labels.cpu().numpy())
+            y_pred.extend(preds.cpu().numpy())
+
+    accuracy = accuracy_score(y_true, y_pred)
+    precision = precision_score(y_true, y_pred, average="macro")
+    recall = recall_score(y_true, y_pred, average="macro")
+    f1 = f1_score(y_true, y_pred, average="macro")
+
+    return {
+        'accuracy': accuracy,
+        'precision': precision,
+        'recall': recall,
+        'f1': f1,
+        'y_true': y_true,
+        'y_pred': y_pred
+    }
+
+#Set-up augmentation procedure
+normalize_transform = v2.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+
+train_transform  = v2.Compose([
+    v2.Resize([224,224]),  # Resize images to a consistent size
+    v2.RandomHorizontalFlip(),
+    v2.RandomRotation(90),
+    v2.ColorJitter(brightness=0.5, contrast=0.5, saturation=0.5, hue=0.5),
+    v2.ToTensor(),           # Convert images to PyTorch tensors
+    normalize_transform
+])
+
+val_transform = v2.Compose([
+    v2.Resize([224,224]),
+    v2.ToTensor(),
+    normalize_transform
+])
+
+# Create DataLoader for training and validation sets
+batch_size = 32
+dataloaders = {'train': DataLoader(train_val_subset, batch_size=batch_size, shuffle=True)}
+
+dataset_sizes = {'train': len(train_val_subset)}
+
+# Accessing the labels
+class_names = train_val_subset.dataset.classes
+print("Class labels:", class_names)
+
+from collections import Counter
+import torch
+
+# Compute class weights based on the dataset
+def compute_class_weights(dataset, indices):
+    """
+    Compute weights for each class based on their frequency in the dataset.
+    Args:
+        dataset: The dataset object.
+        indices: The indices for the subset (train or validation).
+    Returns:
+        A tensor containing weights for each class.
+    """
+    targets = [dataset.dataset.targets[i] for i in indices]  # Get targets for the subset
+    class_counts = Counter(targets)  # Count occurrences of each class
+    total_samples = len(targets)  # Total samples in the subset
+
+    # Compute weight for each class as total_samples / (number of classes * class_count)
+    class_weights = {
+        cls: total_samples / (len(class_counts) * count)
+        for cls, count in class_counts.items()
+    }
+    return torch.tensor([class_weights[i] for i in range(len(class_counts))], dtype=torch.float32)
+
+# Set up Stratified K-Fold
+device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+from sklearn.model_selection import StratifiedKFold
+from torch.utils.data import SubsetRandomSampler
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.optim.lr_scheduler import CyclicLR
+from torchvision.utils import make_grid
+
+
+def train_model_stratified_kfold_with_two_phases(
+    full_dataset, train_transform, val_transform, num_epochs_phase1=5, num_epochs_phase2=50, patience=5, k_folds=5
+):
+    subset_indices = full_dataset.indices
+    subset_targets = [full_dataset.dataset.targets[i] for i in subset_indices]
+    class_names = full_dataset.dataset.classes
+
+    skf = StratifiedKFold(n_splits=k_folds, shuffle=True, random_state=42)
+    results = {}
+    metrics_per_fold = []
+    models_per_fold = []
+    train_eval_metrics_per_fold = []
+
+    for fold, (train_ids, val_ids) in enumerate(skf.split(np.zeros(len(full_dataset)), subset_targets)):
+        print(f'FOLD {fold}')
+        print('-' * 10)
+
+        # Initialize the model
+        model = torchvision.models.resnet18(weights='IMAGENET1K_V1')
+        num_ftrs = model.fc.in_features
+        model.fc = nn.Linear(num_ftrs, len(class_names))
+        model = model.to(device)
+
+        # Create samplers and dataloaders
+        train_sampler = SubsetRandomSampler(train_ids)
+        val_sampler = SubsetRandomSampler(val_ids)
+        train_dataset = ImageFolder(root=full_dataset.dataset.root, transform=train_transform)
+        val_dataset = ImageFolder(root=full_dataset.dataset.root, transform=val_transform)
+        train_loader = DataLoader(train_dataset, sampler=train_sampler, batch_size=32)
+        val_loader = DataLoader(val_dataset, sampler=val_sampler, batch_size=32)
+        dataloaders = {'train': train_loader, 'val': val_loader}
+        dataset_sizes = {'train': len(train_ids), 'val': len(val_ids)}
+
+        # Compute class weights
+        class_weights = compute_class_weights(full_dataset, train_ids).to(device)
+        criterion = nn.CrossEntropyLoss(weight=class_weights)
+
+        # Save the initial model state
+        initial_model_path = f'initial_model_state_fold_{fold}_2phaseTraining.pt'
+        torch.save(model.state_dict(), initial_model_path)
+
+        # Reset the model to its initial state for each fold
+        model.load_state_dict(torch.load(f'initial_model_state_fold_{fold}_2phaseTraining.pt'))
+
+        ## Phase 1: Train only the classification layer
+        for param in model.parameters():
+            param.requires_grad = False
+        for param in model.fc.parameters():
+            param.requires_grad = True
+
+        optimizer = optim.SGD(model.fc.parameters(), lr=0.01, momentum=0.9)
+        scheduler = CyclicLR(optimizer, base_lr=1e-3, max_lr=0.03, step_size_up=136, mode='triangular')
+
+        print(f"Training Phase 1: Only classification layer")
+        train_and_validate(
+            model, dataloaders, dataset_sizes, criterion, optimizer, scheduler, num_epochs_phase1, patience, fold, device, train_phase=1
+        )
+
+        ## Phase 2: Fine-tune the entire model
+        for param in model.parameters():
+            param.requires_grad = True
+
+        optimizer = optim.SGD(model.parameters(), lr=0.001, momentum=0.9)
+        scheduler = CyclicLR(optimizer, base_lr=0.0001, max_lr=0.002, step_size_up=136, mode='triangular')
+
+
+
+        print(f"Training Phase 2: Fine-tuning entire model")
+        train_and_validate(
+            model, dataloaders, dataset_sizes, criterion, optimizer, scheduler, num_epochs_phase2, patience, fold, device, train_phase=2
+        )
+
+        # Save and evaluate the model
+        best_model_path = f'best_model_params_phase_2_fold_{fold}.pt'
+        model.load_state_dict(torch.load(best_model_path))
+        fold_metrics = evaluate_model_metrics(model, val_loader, device)
+        metrics_per_fold.append({
+            'fold': fold,
+            'accuracy': fold_metrics['accuracy'],
+            'precision': fold_metrics['precision'],
+            'recall': fold_metrics['recall'],
+            'f1': fold_metrics['f1']
+        })
+        models_per_fold.append(copy.deepcopy(model))
+
+    return results, metrics_per_fold, models_per_fold
+
+
+def train_and_validate(
+    model, dataloaders, dataset_sizes, criterion, optimizer, scheduler, num_epochs, patience, fold, device, train_phase
+):
+    best_loss = float('inf')
+    epochs_no_improve = 0
+    best_model_path = f'best_model_params_phase_{train_phase}_fold_{fold}.pt'
+    train_losses=[]
+    train_acc = []
+    train_f1 = []
+    eval_losses = []
+    eval_acc = []
+    eval_f1 = []
+    best_f1 = 0.0
+    best_acc = 0.0
+
+    for epoch in range(num_epochs):
+        print(f'Epoch {epoch}/{num_epochs - 1} (Phase {train_phase})')
+        print('-' * 10)
+
+        for phase in ['train', 'val']:
+            if phase == 'train':
+                model.train()
+            else:
+                model.eval()
+
+            running_loss = 0.0
+            running_corrects = 0
+            all_preds = []  
+            all_labels = []  
+
+            for inputs, labels in dataloaders[phase]:
+                inputs, labels = inputs.to(device), labels.to(device)
+                optimizer.zero_grad()
+
+                with torch.set_grad_enabled(phase == 'train'):
+                    outputs = model(inputs)
+                    _, preds = torch.max(outputs, 1)
+                    loss = criterion(outputs, labels)
+
+                    if phase == 'train':
+                        loss.backward()
+                        optimizer.step()
+                        scheduler.step()
+
+                #Statistics
+                running_loss += loss.item() * inputs.size(0)
+                running_corrects += torch.sum(preds == labels.data)
+
+                # Collect all predictions and true labels for F1 score calculation
+                all_preds.extend(preds.cpu().numpy())
+                all_labels.extend(labels.cpu().numpy())
+
+            epoch_loss = running_loss / dataset_sizes[phase]
+            epoch_acc = running_corrects.double() / dataset_sizes[phase]
+            # Calculate F1 score using sklearn's f1_score function
+            epoch_f1 = f1_score(all_labels, all_preds, average='macro')
+
+            if phase == 'train':
+                train_losses.append(epoch_loss)
+                train_acc.append(epoch_acc)
+                train_f1.append(epoch_f1)
+                 # log the current learning rate
+                for param_group in optimizer.param_groups:
+                    current_lr = param_group['lr']
+                print(f'Current Learning Rate: {current_lr:.6f}')  # Print the learning rate
+
+            else:
+                eval_losses.append(epoch_loss)
+                eval_acc.append(epoch_acc)
+                eval_f1.append(epoch_f1)
+                
+
+            print(f'{phase} Loss: {epoch_loss:.4f} Acc: {epoch_acc:.4f} F1: {epoch_f1:.4f}')
+
+            if phase == 'val':
+                if epoch_loss < best_loss:
+                    # Both metrics improved
+                    best_loss = epoch_loss
+                    best_f1 = epoch_f1
+                    best_acc = epoch_acc
+                    torch.save(model.state_dict(), best_model_path)
+                    print(f"New best model saved at epoch {epoch+1}.")
+                    epochs_no_improve = 0
+                else:
+                    # No improvement in both metrics
+                    epochs_no_improve += 1
+                    print(f"No improvement in validation metrics. Patience counter: {epochs_no_improve}/{patience}")
+
+        if epochs_no_improve > patience:
+            print(f"Early stopping in Phase {train_phase}.")
+            break
+# Apply Stratified K-Fold Cross-Validation
+k_folds = 5
+results_kfold, metrics_per_fold, models_conv_kfold= train_model_stratified_kfold_with_two_phases(full_dataset = train_val_subset, train_transform=train_transform,val_transform=val_transform, num_epochs_phase1 = 10 ,num_epochs_phase2=75, patience=10, k_folds=k_folds)
+
+
+Mobile-ViT-V2 model training code
+
+#Set-up model and Image processor
+from transformers import MobileViTV2ForImageClassification, AutoImageProcessor, ViTImageProcessor
+model_checkpoint  = "apple/mobilevitv2-1.0-imagenet1k-256"
+image_processor = ViTImageProcessor.from_pretrained(model_checkpoint)
+
+#Set-up performance metrics
+import evaluate
+
+metric = evaluate.load("accuracy")
+eval_metric_precision = evaluate.load('precision')
+eval_metric_recall = evaluate.load('recall')
+
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+from transformers import EvalPrediction
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support
+import numpy as np
+
+def compute_metrics(pred):
+    # Check the shape of predictions and labels
+    print(f"Predictions shape: {np.array(pred.predictions).shape}")
+    print(f"Labels shape: {np.array(pred.label_ids).shape}")
+
+    # Ensure predictions are a NumPy array and take argmax if multi-class
+    if len(np.array(pred.predictions).shape) > 1:
+        preds = np.argmax(np.array(pred.predictions), axis=-1)
+    else:
+        preds = np.array(pred.predictions)
+
+    labels = np.array(pred.label_ids)
+
+    # Compute metrics
+    accuracy = accuracy_score(labels, preds)
+    precision, recall, f1, _ = precision_recall_fscore_support(labels, preds, average='macro')
+
+    return {
+        'accuracy': accuracy,
+        'precision': precision,
+        'recall': recall,
+        'f1': f1
+    }
+
+#Set-up augmentation procedure
+from torchvision.transforms import (
+    CenterCrop,
+    Compose,
+    Normalize,
+    RandomHorizontalFlip,
+    RandomResizedCrop,
+    RandomRotation,
+    Resize,
+    ColorJitter,
+    ToTensor,
+)
+
+normalize = Normalize(mean=image_processor.image_mean, std=image_processor.image_std)
+if "height" in image_processor.size:
+    size = (image_processor.size["height"], image_processor.size["width"])
+    crop_size = size
+    max_size = None
+elif "shortest_edge" in image_processor.size:
+    size = image_processor.size["shortest_edge"]
+    crop_size = (size, size)
+    max_size = image_processor.size.get("longest_edge")
+
+train_transforms = Compose(
+        [
+            RandomResizedCrop(crop_size),
+            RandomHorizontalFlip(),
+            RandomRotation(90),
+            ColorJitter(brightness=0.5, contrast=0.5, saturation=0.5, hue=0.5),
+            ToTensor(),
+            normalize,
+        ]
+    )
+
+val_transforms = Compose(
+        [
+            Resize(size),
+            CenterCrop(crop_size),
+            ToTensor(),
+            normalize,
+        ]
+    )
+
+def preprocess_train(example_batch):
+    example_batch["pixel_values"] = [
+        train_transforms(image.convert("RGB")) for image in example_batch["image"]
+    ]
+    return example_batch
+
+def preprocess_val(example_batch):
+    example_batch["pixel_values"] = [val_transforms(image.convert("RGB")) for image in example_batch["image"]]
+    return example_batch
+
+import torch
+def collate_fn(examples):
+    pixel_values = torch.stack([example["pixel_values"] for example in examples])
+    labels = torch.tensor([example["label"] for example in examples])
+    return {"pixel_values": pixel_values, "labels": labels}
+
+#Define Training Arguments
+from transformers import TrainingArguments, Trainer
+batch_size = 32
+model_name = model_checkpoint.split("/")[-1]
+
+args = TrainingArguments(
+    f"{model_name}-finetuned",
+    remove_unused_columns=False,
+    evaluation_strategy = "epoch",
+    logging_strategy="epoch",  # Logs after each epoch
+    save_strategy="epoch",     # Saves after each epoch
+    learning_rate=0.0005,
+    per_device_train_batch_size=batch_size,
+    gradient_accumulation_steps=4,
+    per_device_eval_batch_size=batch_size,
+    num_train_epochs=50,
+    warmup_ratio=0.1,
+    load_best_model_at_end=True,
+    metric_for_best_model="eval_loss"
+    )
+
+from transformers import EarlyStoppingCallback
+import os
+import numpy as np
+import torch
+from sklearn.model_selection import StratifiedKFold
+
+# Extract labels
+labels = np.array(full_dataset["train"]["label"])
+
+# Set up Stratified K-Fold
+device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+k_folds = 5
+skf = StratifiedKFold(n_splits=k_folds, shuffle=True)
+
+# Run K-fold model training
+for fold, (train_idx, val_idx) in enumerate(skf.split(np.zeros(len(labels)), labels)):
+    print(f"Fold {fold}")
+
+    # Create train and validation subsets using indices
+    train_subset = full_dataset["train"].select(train_idx)
+    val_subset = full_dataset["train"].select(val_idx)
+
+    # Apply preprocessing
+    train_subset.set_transform(preprocess_train)
+    val_subset.set_transform(preprocess_val)
+
+    # Set fold-specific output directory
+    output_dir = os.path.join(base_output_dir, f"2State_fold_{fold}")
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Update Trainer args to include the new output directory for each fold
+    args.output_dir = output_dir
+
+    # Reinitialize the model for each fold
+    model_fold = MobileViTV2ForImageClassification.from_pretrained(model_checkpoint, num_labels=2, id2label = id2label, label2id = label2id, ignore_mismatched_sizes=True)
+    for param in model_fold.base_model.parameters():
+        param.requires_grad = True
+
+    # Define early stopping callback
+    early_stopping_callback = EarlyStoppingCallback(
+        early_stopping_patience=3,  # Number of epochs with no improvement before stopping
+        early_stopping_threshold=0.001
+    )
+
+    # Initialize a new Trainer for each fold with a fresh model
+    trainer = Trainer(
+        model_fold,
+        args,
+        train_dataset=train_subset,
+        eval_dataset=val_subset,
+        tokenizer=image_processor,
+        compute_metrics=compute_metrics,
+        data_collator=collate_fn,
+        callbacks=[early_stopping_callback]
+    )
+
+    # Train the model
+    train_results = trainer.train()
+
+    # Save model and results for the current fold
+    trainer.save_model(output_dir)
+    trainer.log_metrics(f"train_fold_{fold}", train_results.metrics)
+    trainer.save_metrics(f"train_fold_{fold}", train_results.metrics)
+
+    # Run evaluation on validation dataset to compute and save eval metrics
+    eval_results = trainer.evaluate(eval_dataset=val_subset)
+    trainer.log_metrics(f"eval_fold_{fold}", eval_results)
+    trainer.save_metrics(f"eval_fold_{fold}", eval_results)
+
+    # Save the trainer state
+    trainer.save_state()
+    print(f"Model and results saved for fold {fold}")
+
+
+
